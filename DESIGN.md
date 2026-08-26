@@ -1,92 +1,43 @@
 # DESIGN
 
 ## Chunking strategy
-PDF text is extracted per-page (`pypdf`), whitespace-normalized, then split
-into sentence-boundary-aware groups of up to ~250 characters. Chunks never cross a
-page boundary — each chunk therefore has exactly one, unambiguous page
-number, which keeps citations honest and simple. Sentence boundaries avoid
-cutting facts through the middle of a sentence. Chunk size was chosen
-empirically as a reasonable balance for a small extractive stub: large
-enough to hold a complete sentence/fact, small enough to keep retrieval
-precise.
 
-## Embedding / vector-store choice
-Embeddings: **Sentence Transformers**, model `all-MiniLM-L6-v2`
-(384-dimensional), run locally via the `sentence-transformers` package —
-no paid API key, no per-query network call. The model downloads once from
-the Hugging Face Hub on first use (~90MB) and is cached locally afterward,
-so the service runs fully offline after that first download.
+PDF text is extracted **per page** using `pypdf`. Each page is whitespace-normalized and split into sentence-boundary-aware chunks of approximately **250 characters maximum**. Chunks never cross page boundaries, so every chunk has an unambiguous source page. Sentence-aware splitting keeps individual facts and statements intact while producing smaller retrieval units than page-level chunks.
 
-Vector store: **FAISS** `IndexFlatIP` — one index per document, built at
-ingest time, held in memory for the process lifetime. Chunk embeddings are
-L2-normalized before insertion, so inner product on `IndexFlatIP` is
-equivalent to cosine similarity.
+Each chunk retains `doc_id`, `page`, `chunk_id`, and `text` metadata for retrieval and citation.
 
-An earlier version of this service used TF-IDF instead of a neural
-embedding model, specifically to avoid any model download. That was
-dropped: TF-IDF only matches shared vocabulary, so a question like *"What
-AI technologies are mentioned?"* fails to retrieve a chunk that says *"built
-RAG pipelines using LangChain and vector search"* — there's no literal word
-overlap, even though it's exactly the right chunk. A sentence embedding
-model captures that semantic relationship instead of requiring the
-question and the answer to share words.
+## Embeddings / vector store
 
-Every retrieved result still carries `doc_id`, `page`, `chunk_id`, and
-`text` (see `app/ingest.py`'s `Chunk` dataclass and `app/store.py`'s
-`DocumentIndex.search`), so citation metadata survives the embedding change
-unchanged.
+The service uses the Sentence Transformers model **`all-MiniLM-L6-v2`** to create 384-dimensional semantic embeddings locally. Embeddings are L2-normalized and stored in a per-document **FAISS `IndexFlatIP`** index. Because the vectors are normalized, inner-product search is equivalent to cosine-similarity search.
+
+The index is held in memory for the lifetime of the process, which is sufficient for the scope of this exercise. The model is downloaded once from Hugging Face when first required and then cached locally. No paid embedding API is used.
 
 ## Grounding enforcement
-Two layers, both required for a non-abstained answer:
 
-1. **Retrieval gate** — top-k chunks (k=5) are retrieved by cosine
-   similarity against the MiniLM embedding of the question; only chunks
-   the best score must be ≥ 0.28; nearby results within 0.20 of that best
-   score are also retained as candidate context. Below the absolute floor,
-   the question and the document are considered unrelated. This threshold
-   is calibrated for MiniLM's cosine-similarity range (genuinely related
-   short texts commonly score ~0.3–0.6+; unrelated text is usually well
-   under 0.28) — it is a different constant than the TF-IDF version used,
-   because TF-IDF and neural cosine similarity have very different score
-   distributions. It is deliberately not set near zero: a low-enough
-   threshold would let the system "answer" questions the document doesn't
-   actually support, which the assignment explicitly rules out.
-2. **Extractive answering** — the "LLM" (`MockLLM`, behind an `LLMClient`
-   interface so a real model can be swapped in later) does not generate
-   free text. It receives only the chunks that cleared the retrieval gate,
-   and returns *verbatim sentences* from them, ranked by lexical overlap
-   with the question (used only to pick which sentences to surface, not as
-   a second relevance gate — relevance was already decided by retrieval).
-   Because the answer is copy-pasted from retrieved text, no fact can be
-   invented — grounding is enforced by construction, not by prompting a
-   generative model to "only use the context" and hoping.
+Grounding is enforced in two stages:
 
-Citations are derived from exactly which chunks contributed the sentences
-used in the answer (not all retrieved chunks), so every citation actually
-supports a piece of the answer.
+1. **Retrieval filtering:** the question is embedded and the top candidate chunks are retrieved using FAISS similarity search. A conservative relevance floor of **0.28** prevents clearly unrelated questions from reaching the answering stage. Relevant nearby results can also be retained within a bounded score band around a strong result, and bounded same-page corroboration is allowed so that useful supporting context is not discarded solely because it has a slightly lower score.
 
-## Abstention logic
-"Not in the document" is decided at the retrieval gate described above: if
-the top retrieval score is below the absolute floor and there is no bounded
-same-page corroboration, or nothing is retrieved at all, the pipeline returns
-`abstained: true`, an empty
-citations list, and a fixed safe message — and never reaches the answering
-step, so there is no path by which the mock LLM can output invented
-content. If retrieval finds relevant chunks but the extraction step somehow
-produces no text (e.g. empty chunk list edge case), that also abstains
-rather than falling back to any kind of default or generated answer.
+2. **Extractive answering:** the `LLMClient` interface is implemented by `MockLLM` for this assignment. It receives only the chunks that passed the retrieval gate and selects sentences **verbatim from those chunks**. It does not generate facts or use outside knowledge. Lexical overlap is used only to rank candidate sentences; semantic relevance is determined by the embedding retrieval stage.
 
-## Change log vs. the original TF-IDF version
-- `app/store.py`: TF-IDF vectorizer → `SentenceTransformer('all-MiniLM-L6-v2')`,
-  `IndexFlatIP` retained.
-- `app/answer.py`: similarity threshold is calibrated to 0.28 for normalized
-  MiniLM cosine scores, with bounded same-page support for lower-score
-  clusters and a 0.20 score band around a strong best match.
-- `app/llm.py`: `MockLLM` previously required literal keyword overlap
-  between the question and a candidate sentence as a hard pass/fail gate.
-  That double-gated relevance on top of retrieval and caused correct,
-  semantically-retrieved chunks to be rejected at the extraction step for
-  broad/paraphrased questions. Lexical overlap is now used only to *rank*
-  candidate sentences; if none have any overlap, the top-ranked (i.e. most
-  semantically relevant per retrieval) chunk's own sentences are used as a
-  fallback — still 100% drawn from retrieved text, never generated.
+Citations are generated from the chunks whose sentences actually appear in the final answer rather than from every retrieved chunk. This keeps each citation tied to supporting source material.
+
+## Abstention
+
+If retrieval does not produce sufficiently relevant evidence, the service abstains instead of attempting to answer. The relevance floor and bounded corroboration rules are deliberately conservative. An unsupported or unrelated question therefore returns:
+
+```json
+{
+  "answer": "The provided document does not contain information to answer this question.",
+  "citations": [],
+  "abstained": true
+}
+```
+
+If retrieval succeeds but the extractive answering step cannot select any source text, the service also abstains. There is no fallback to external knowledge or free-form generation, so unsupported answers cannot be fabricated by the mock LLM.
+
+## Why this design
+
+The original implementation used larger page-level character chunks and a strict top-score gate. That made precise facts less focused in embeddings and caused broader semantic questions to lose nearby relevant evidence. The final design uses smaller sentence-aware chunks plus conservative corroboration to improve both precise and broad retrieval while preserving abstention for unsupported questions.
+
+The implementation remains intentionally small and aligned with the assignment scope: FastAPI, runtime PDF parsing, Sentence Transformers, FAISS, an LLM interface with a local mock implementation, grounded citations, and explicit abstention. No external paid LLM, API key, CUDA/NVIDIA dependency, TF-IDF retrieval, or document-specific hardcoding is required.
